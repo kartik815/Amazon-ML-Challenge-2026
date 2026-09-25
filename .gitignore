@@ -1,0 +1,22 @@
+# Challenge dataset
+Dataset/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Jupyter
+.ipynb_checkpoints/
+
+# VS Code
+.vscode/
+
+# Environment files
+.env
+
+# Large ML files
+*.pkl
+*.joblib
+*.h5
+*.pt
+*.pth
