@@ -1,11 +1,14 @@
-"""Blocking evaluation.
+"""Blocking evaluation (memory-bounded).
 
-Measures, on the training data:
+Source-driven: S2/S3 are streamed against the S1 index, so no source index or
+source text is held in RAM.
+
+Measures:
 
 * recall of each blocker on its own
-* recall of the union of the frozen three (the 87.24% baseline)
-* recall of the union including the advanced blockers (the new ceiling)
-* candidate volume per S1 (mean / median / p95 / p99 / max / zero-candidate)
+* recall of the frozen union (the 87.24% baseline)
+* recall of the advanced union (the new ceiling)
+* candidate volume per S1
 
 Run:
 
@@ -20,89 +23,82 @@ import sys
 from collections import defaultdict
 
 import numpy as np
-import pandas as pd
 
-from .blocking import build_blocker, candidates_by_blocker
 from .config import ADVANCED_BLOCKERS, CHUNK_SIZE, FROZEN_BLOCKERS
 from .features import load_ground_truth
+from .reverse import build_allowed_sets, build_s1_blocker, iter_pairs_by_blocker
 
 
 def evaluate(s1_path, source_paths, gt_path, enabled, chunk_size=CHUNK_SIZE):
     gt = load_ground_truth(gt_path)
-    print("ground-truth S1 entities:", len(gt))
+    total = sum(len(v) for v in gt.values())
+    print("ground-truth S1 entities:", len(gt), "| true matches:", f"{total:,}")
 
-    blockers = {}
-    for tag, path in source_paths.items():
-        if os.path.exists(path):
-            blockers[tag] = build_blocker(path, tag, enabled=enabled, chunk_size=chunk_size)
+    # Reverse ground truth: candidate id -> set of S1 ids it truly matches.
+    gt_rev = {}
+    for s1_id, cand_ids in gt.items():
+        for cand_id in cand_ids:
+            gt_rev.setdefault(cand_id, set()).add(s1_id)
 
-    total = 0
-    captured_union = 0
-    captured_base = 0
+    allowed_name, allowed_addr, allowed_char3 = build_allowed_sets(
+        source_paths, chunk_size
+    )
+    blocker = build_s1_blocker(
+        s1_path, allowed_name, allowed_addr, allowed_char3, enabled, chunk_size
+    )
+    s1_universe = len(blocker["text"])
+
+    captured = 0
+    captured_frozen = 0
     per_blocker = defaultdict(int)
-    cand_counts = []
-    s1_with_matches = 0
-    hard_misses = 0
+    cand_counts = defaultdict(int)
+    captured_per_s1 = defaultdict(int)
 
-    for chunk in pd.read_csv(
-        s1_path,
-        sep="\t",
-        usecols=["entity_id", "country_norm", "name_core", "address_norm"],
-        chunksize=chunk_size,
-        dtype="string",
+    for cand_id, tag, cand_tuple, by in iter_pairs_by_blocker(
+        source_paths, blocker, chunk_size
     ):
-        for eid, country, name, address in zip(
-            chunk["entity_id"], chunk["country_norm"],
-            chunk["name_core"], chunk["address_norm"],
-        ):
-            true_ids = gt.get(eid, set())
-            if not true_ids:
-                continue
-            s1_with_matches += 1
-            per_s1_candidates = 0
-            any_captured = False
+        union = set().union(*by.values()) if by else set()
+        for s1_id in union:
+            cand_counts[s1_id] += 1
 
-            for tag, blocker in blockers.items():
-                prefix = f"{tag}-"
-                true_tag = {x for x in true_ids if x.startswith(prefix)}
+        true_s1 = gt_rev.get(cand_id)
+        if not true_s1:
+            continue
 
-                by = candidates_by_blocker(country, name, address, blocker)
-                if by:
-                    union_tag = set().union(*by.values())
-                    base_tag = set().union(
-                        *[by[b] for b in FROZEN_BLOCKERS if b in by]
-                    ) if any(b in by for b in FROZEN_BLOCKERS) else set()
-                else:
-                    union_tag, base_tag = set(), set()
+        hit = true_s1 & union
+        if hit:
+            captured += len(hit)
+            for s1_id in hit:
+                captured_per_s1[s1_id] += 1
 
-                total += len(true_tag)
-                captured_union += len(true_tag & union_tag)
-                captured_base += len(true_tag & base_tag)
-                any_captured = any_captured or bool(true_tag & union_tag)
+        frozen_sets = [by[b] for b in FROZEN_BLOCKERS if b in by]
+        if frozen_sets:
+            captured_frozen += len(true_s1 & set().union(*frozen_sets))
 
-                for bname, ids in by.items():
-                    per_blocker[bname] += len(true_tag & ids)
+        for bname, ids in by.items():
+            per_blocker[bname] += len(true_s1 & ids)
 
-                per_s1_candidates += len(union_tag)
+    del blocker, gt_rev
+    gc.collect()
 
-            cand_counts.append(per_s1_candidates)
-            if true_ids and not any_captured:
-                hard_misses += 1
+    counts = np.asarray(list(cand_counts.values()), dtype="float64")
+    if counts.size == 0:
+        counts = np.zeros(1)
 
-        del chunk
-        gc.collect()
-
-    counts = np.asarray(cand_counts) if cand_counts else np.zeros(1)
+    s1_with_matches = sum(1 for v in gt.values() if v)
+    hard_misses = sum(
+        1 for s1_id, v in gt.items() if v and captured_per_s1.get(s1_id, 0) == 0
+    )
 
     result = {
         "enabled": list(enabled),
         "total_true_matches": int(total),
-        "captured_union": int(captured_union),
-        "recall_union": captured_union / total if total else 0.0,
-        "captured_frozen": int(captured_base),
-        "recall_frozen": captured_base / total if total else 0.0,
-        "incremental_captured": int(captured_union - captured_base),
-        "incremental_recall": (captured_union - captured_base) / total if total else 0.0,
+        "captured_union": int(captured),
+        "recall_union": captured / total if total else 0.0,
+        "captured_frozen": int(captured_frozen),
+        "recall_frozen": captured_frozen / total if total else 0.0,
+        "incremental_captured": int(captured - captured_frozen),
+        "incremental_recall": (captured - captured_frozen) / total if total else 0.0,
         "per_blocker_captured": {k: int(v) for k, v in per_blocker.items()},
         "per_blocker_recall": {
             k: (v / total if total else 0.0) for k, v in per_blocker.items()
@@ -115,7 +111,7 @@ def evaluate(s1_path, source_paths, gt_path, enabled, chunk_size=CHUNK_SIZE):
             "p95": float(np.percentile(counts, 95)),
             "p99": float(np.percentile(counts, 99)),
             "max": float(counts.max()),
-            "zero_s1": int((counts == 0).sum()),
+            "zero_s1": int(max(0, s1_universe - len(cand_counts))),
         },
     }
     return result
@@ -152,8 +148,8 @@ def main(argv=None):
     parser.add_argument("--gt", required=True, help="train_ground_truth.tsv")
     parser.add_argument("--s1", default=None, help="defaults to <cleaned>/train_s1_cleaned.tsv")
     parser.add_argument("--out", default=None, help="optional JSON output path")
+    parser.add_argument("--chunk-size", type=int, default=CHUNK_SIZE)
     parser.add_argument("--advanced", action="store_true", help="include advanced blockers")
-    parser.add_argument("--frozen", action="store_true", help="only the frozen three")
     args = parser.parse_args(argv)
 
     enabled = ADVANCED_BLOCKERS if args.advanced else FROZEN_BLOCKERS
@@ -163,7 +159,7 @@ def main(argv=None):
         "S3": os.path.join(args.cleaned, "train_s3_cleaned.tsv"),
     }
 
-    result = evaluate(s1_path, source_paths, args.gt, enabled)
+    result = evaluate(s1_path, source_paths, args.gt, enabled, args.chunk_size)
     report(result)
 
     if args.out:
@@ -176,4 +172,5 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    sys.exit(0 if main() else 0)
+    main()
+    sys.exit(0)

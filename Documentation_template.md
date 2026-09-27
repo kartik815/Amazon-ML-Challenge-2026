@@ -136,11 +136,23 @@ to blocking).
 
 ## 6. Other relevant information
 
-**Memory discipline.** The dataset can exhaust a default Colab session, so all
-stages stream with `chunksize`, process one source at a time, use `usecols` and
-explicit dtypes, prefer vectorised `.str` operations over `.apply`, and
-`gc.collect()` between stages. Candidate tables are never fully materialised in
-one piece where avoidable.
+**Memory discipline.** The dataset can exhaust a default Colab session. The
+dominant cost was indexing the noisy sources and holding their text: the source
+posting lists plus the source text lookup together run to several GB per source.
+We therefore **invert the join**: only the reference side (S1) is indexed and
+kept in memory, while S2/S3 are streamed chunk by chunk. For each source record
+the blocking keys are computed once and looked up against the S1 index, so
+candidate pairs are identical to the source-indexed version with a fraction of
+the memory. Training accumulates feature rows into small numpy buffers (never a
+Python list of per-row lists) and keeps ids only for validation rows. Inference
+spills scored pairs into bounded buckets keyed by S1 position, so the two output
+files are produced one slice at a time rather than holding every pair.
+
+All stages stream with `chunksize`, process one source at a time, use `usecols`
+and explicit dtypes, prefer vectorised `.str` operations over `.apply`, and
+`gc.collect()` between stages. Chunk size and bucket count are tunable
+(`--chunk-size`, `--buckets`) and all intermediate artefacts are checkpointed to
+persistent storage so a crash never loses earlier work.
 
 **Reproducibility.** `code/business_entity_resolution/` reproduces both outputs
 end-to-end:

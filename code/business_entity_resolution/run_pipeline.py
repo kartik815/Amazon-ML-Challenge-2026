@@ -14,7 +14,12 @@ import os
 import sys
 
 from src import decision, evaluate_blocking, inference, normalization, training, validate_submission
-from src.config import ADVANCED_BLOCKERS, FROZEN_BLOCKERS
+from src.config import (
+    ADVANCED_BLOCKERS,
+    CHUNK_SIZE,
+    FROZEN_BLOCKERS,
+    INFERENCE_BUCKETS,
+)
 
 
 def _blockers(args):
@@ -29,7 +34,8 @@ def run_train(args):
     cleaned_dir = os.path.join(args.work_dir, "cleaned")
     gt_path = os.path.join(args.data_dir, "train", "train_ground_truth.tsv")
     return training.run_training(
-        cleaned_dir, args.model_dir, gt_path, enabled_blockers=_blockers(args)
+        cleaned_dir, args.model_dir, gt_path,
+        chunk_size=args.chunk_size, enabled_blockers=_blockers(args),
     )
 
 
@@ -42,7 +48,7 @@ def run_evaluate_blocking(args):
         "S3": os.path.join(cleaned_dir, "train_s3_cleaned.tsv"),
     }
     result = evaluate_blocking.evaluate(
-        s1_path, source_paths, gt_path, _blockers(args)
+        s1_path, source_paths, gt_path, _blockers(args), args.chunk_size
     )
     evaluate_blocking.report(result)
     out = os.path.join(args.model_dir, "blocking_eval.json")
@@ -63,7 +69,9 @@ def run_tune(args):
 def run_predict(args):
     cleaned_dir = os.path.join(args.work_dir, "cleaned")
     return inference.run_inference(
-        cleaned_dir, args.model_dir, args.output_dir, enabled_blockers=_blockers(args)
+        cleaned_dir, args.model_dir, args.output_dir,
+        chunk_size=args.chunk_size, enabled_blockers=_blockers(args),
+        num_buckets=args.buckets,
     )
 
 
@@ -108,6 +116,18 @@ def main(argv=None):
         "--advanced-blocking",
         action="store_true",
         help="use the advanced blocker set (char3 + phonetic)",
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=CHUNK_SIZE,
+        help="rows per read chunk; lower it on a small Colab runtime",
+    )
+    parser.add_argument(
+        "--buckets",
+        type=int,
+        default=INFERENCE_BUCKETS,
+        help="number of inference spill buckets (higher = less RAM)",
     )
     args = parser.parse_args(argv)
 

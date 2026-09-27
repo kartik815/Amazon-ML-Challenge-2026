@@ -74,6 +74,29 @@ Measure the ceiling before deciding:
 python run_pipeline.py --stage evaluate-blocking --work-dir work --advanced-blocking
 ```
 
+## Running on Colab (RAM-safe)
+
+The pipeline is built to survive a default Colab runtime:
+
+* **Reverse blocking** — only the reference side (S1) is indexed and kept in
+  memory; S2/S3 are streamed chunk by chunk. The old design held the full source
+  text lookup *and* the source posting lists, which is several GB per source.
+* **Buffered features** — training rows accumulate into small numpy buffers, not
+  a Python list of per-row lists.
+* **Bucketed inference** — scored pairs are spilled to disk in bounded buckets,
+  so the two output files are produced one slice at a time.
+
+On a small runtime lower the chunk size and raise the bucket count:
+
+```bash
+python run_pipeline.py all --data-dir dataset --output-dir output \
+    --advanced-blocking --chunk-size 50000 --buckets 512
+```
+
+Write `--work-dir` to persistent storage (Drive) so a crash never loses the
+normalised data, model or decision config. Notebook
+`10_Colab_Run.ipynb` runs all of this end to end.
+
 ## Validate before submitting
 
 ```bash
@@ -90,10 +113,11 @@ this validator implements the same checks (stdlib only).
 
 1. **Normalisation** — `src/normalization.py`
 2. **Blocking** (exact name + name token + address token, union) — `src/blocking.py`
-3. **Features** (6 base + 18 complementary = 24) — `src/features.py`
-4. **Model** (HistGradientBoosting, S1-grouped validation split) — `src/training.py`
-5. **Decision layer** (per-S1 threshold, macro F0.5) — `src/decision.py`
-6. **Inference and submission** — `src/inference.py`
+3. **Reverse candidate generation** (index S1, stream S2/S3) — `src/reverse.py`
+4. **Features** (6 base + 18 complementary = 24) — `src/features.py`
+5. **Model** (HistGradientBoosting, S1-grouped validation split) — `src/training.py`
+6. **Decision layer** (per-S1 threshold, macro F0.5) — `src/decision.py`
+7. **Inference and submission** (bucketed spill) — `src/inference.py`
 
 Country is treated as an open set of string labels everywhere; token frequency
 thresholds are recomputed from whichever corpus is being blocked, so unseen

@@ -12,6 +12,7 @@ This file only maps the repository.
 raw sources
   -> normalise            notebooks/03, code/.../src/normalization.py
   -> blocking (frozen + advanced)  notebooks/04, 09, code/.../src/blocking.py
+  -> reverse candidate generation  code/.../src/reverse.py
   -> pairwise features    notebooks/05, 06, code/.../src/features.py
   -> model (HistGB)       notebooks/06, code/.../src/training.py
   -> S1 decision layer    notebooks/07, code/.../src/decision.py
@@ -31,6 +32,7 @@ raw sources
 | `07_Decision_Layer.ipynb` | S1 decision layer + macro F0.5 tuning |
 | `08_Test_Inference.ipynb` | Test inference + submission files |
 | `09_Blocking_Improvement.ipynb` | Measures frozen vs improved blocking recall |
+| `10_Colab_Run.ipynb` | Memory-safe end-to-end run on Colab |
 
 ## Submission artefacts
 

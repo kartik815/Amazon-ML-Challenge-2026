@@ -141,6 +141,11 @@ MAX_PHONETIC_BLOCK = 500
 CHUNK_SIZE = 200_000
 FEATURE_BATCH = 200_000
 
+# Inference spilling: scored pairs are bucketed by S1 position so the outputs
+# can be produced one bounded slice at a time instead of holding every pair.
+INFERENCE_BUCKETS = 256
+BUCKET_BUFFER_ROWS = 1_000_000
+
 RANDOM_SEED = 42
 
 # Deterministic S1 split for validation (~2%).

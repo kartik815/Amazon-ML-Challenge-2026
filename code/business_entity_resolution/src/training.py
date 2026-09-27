@@ -1,8 +1,11 @@
 """Training of the pairwise matcher.
 
-Builds the training candidate set with the frozen blockers, labels it from the
-ground truth, computes features, splits by S1 entity and fits a
-HistGradientBoostingClassifier.
+Uses memory-bounded reverse blocking (:mod:`src.reverse`): S1 is indexed and
+S2/S3 are streamed, so no source text or source posting lists are held in RAM.
+
+Feature rows are accumulated into small numpy buffers and concatenated once, so
+there is never a giant Python list of per-row lists or id strings. Only
+validation rows keep their ids (needed for the decision layer).
 """
 
 import gc
@@ -16,9 +19,9 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import HistGradientBoostingClassifier
 
-from .blocking import build_blocker, iter_candidates
 from .config import (
     CHUNK_SIZE,
+    FEATURE_BATCH,
     FEATURE_COLUMNS,
     FROZEN_BLOCKERS,
     MAX_TRAIN_NEG,
@@ -29,13 +32,8 @@ from .config import (
     VAL_HASH_MOD,
     VAL_HASH_REM,
 )
-from .features import (
-    build_text_lookup,
-    compute_pair_features,
-    features_to_vector,
-    finalize_matrix,
-    load_ground_truth,
-)
+from .features import compute_pair_features, features_to_vector, load_ground_truth
+from .reverse import build_allowed_sets, build_s1_blocker, iter_pairs
 
 
 def stable_bucket(text, mod):
@@ -48,41 +46,51 @@ def is_validation_entity(s1_id):
 
 
 def build_training_matrix(
-    s1_path, s2_path, s3_path, gt_path, chunk_size=CHUNK_SIZE,
+    s1_path,
+    s2_path,
+    s3_path,
+    gt_path,
+    chunk_size=CHUNK_SIZE,
     enabled_blockers=None,
 ):
-    """Return the training feature matrix plus validation ids and labels."""
+    """Return (X, y, val_mask, val_ids, val_cands, val_sources)."""
     enabled_blockers = enabled_blockers or FROZEN_BLOCKERS
-    gt_lookup = load_ground_truth(gt_path)
-    print("ground-truth S1 entities:", len(gt_lookup))
 
-    s1_text = build_text_lookup(s1_path, chunk_size=chunk_size)
-    print("S1 records:", len(s1_text))
+    gt = load_ground_truth(gt_path)
+    print("ground-truth S1 entities:", len(gt))
 
     source_paths = {"S2": s2_path, "S3": s3_path}
-    blockers = {}
-    source_text = {}
-    for tag, path in source_paths.items():
-        if not os.path.exists(path):
-            continue
-        blockers[tag] = build_blocker(
-            path, tag, enabled=enabled_blockers, chunk_size=chunk_size
-        )
-        source_text[tag] = build_text_lookup(path, chunk_size=chunk_size)
-        print(f"{tag} text records:", len(source_text[tag]))
+    allowed_name, allowed_addr, allowed_char3 = build_allowed_sets(
+        source_paths, chunk_size
+    )
+    s1_blocker = build_s1_blocker(
+        s1_path, allowed_name, allowed_addr, allowed_char3,
+        enabled_blockers, chunk_size,
+    )
 
     rng = random.Random(RANDOM_SEED)
 
-    ids, cands, sources, labels, is_val_flags, rows = [], [], [], [], [], []
+    X_parts, y_parts, val_parts = [], [], []
+    val_ids, val_cands, val_sources = [], [], []
+
+    batch_X, batch_y, batch_val = [], [], []
     stats = {"pos": 0, "neg": 0, "val_rows": 0}
 
-    for s1_id, cand_id, source_tag in iter_candidates(s1_path, blockers, chunk_size):
-        s1 = s1_text.get(s1_id)
-        cand = source_text.get(source_tag, {}).get(cand_id)
-        if s1 is None or cand is None:
-            continue
+    def flush():
+        if not batch_X:
+            return
+        X_parts.append(np.asarray(batch_X, dtype="float32"))
+        y_parts.append(np.asarray(batch_y, dtype="int8"))
+        val_parts.append(np.asarray(batch_val, dtype=bool))
+        batch_X.clear()
+        batch_y.clear()
+        batch_val.clear()
 
-        label = int(cand_id in gt_lookup.get(s1_id, set()))
+    for s1_id, cand_id, s1_tuple, cand_tuple, tag in iter_pairs(
+        source_paths, s1_blocker, chunk_size
+    ):
+        true_ids = gt.get(s1_id)
+        label = int(true_ids is not None and cand_id in true_ids)
         is_val = is_validation_entity(s1_id)
 
         if label == 1:
@@ -95,40 +103,58 @@ def build_training_matrix(
                 if rng.random() > TRAIN_NEG_RATE:
                     continue
 
-        feats = compute_pair_features(s1, cand, source_tag)
+        feats = compute_pair_features(s1_tuple, cand_tuple, tag)
+        batch_X.append(features_to_vector(feats))
+        batch_y.append(label)
+        batch_val.append(is_val)
 
-        ids.append(s1_id)
-        cands.append(cand_id)
-        sources.append(source_tag)
-        labels.append(label)
-        is_val_flags.append(is_val)
-        rows.append(features_to_vector(feats))
-
-        stats["pos" if label == 1 else "neg"] += 1
         if is_val:
+            val_ids.append(s1_id)
+            val_cands.append(cand_id)
+            val_sources.append(tag)
             stats["val_rows"] += 1
 
-    del s1_text, source_text, blockers
+        stats["pos" if label == 1 else "neg"] += 1
+
+        if len(batch_X) >= FEATURE_BATCH:
+            flush()
+
+    flush()
+
+    del s1_blocker
     gc.collect()
 
-    print("kept rows:", len(rows), stats)
+    n_features = len(FEATURE_COLUMNS)
+    if X_parts:
+        X = np.nan_to_num(np.concatenate(X_parts, axis=0), nan=0.0)
+        y = np.concatenate(y_parts, axis=0)
+        val_mask = np.concatenate(val_parts, axis=0)
+    else:
+        X = np.zeros((0, n_features), dtype="float32")
+        y = np.zeros((0,), dtype="int8")
+        val_mask = np.zeros((0,), dtype=bool)
 
-    X = finalize_matrix(rows)
-    y = np.asarray(labels, dtype="int8")
-    val_mask = np.asarray(is_val_flags, dtype=bool)
+    print("kept rows:", len(X), stats)
+    del X_parts, y_parts, val_parts
+    gc.collect()
 
-    return X, y, val_mask, ids, cands, sources
+    return X, y, val_mask, val_ids, val_cands, val_sources
 
 
-def run_training(cleaned_dir, model_dir, gt_path, chunk_size=CHUNK_SIZE,
-                 enabled_blockers=None):
+def run_training(
+    cleaned_dir,
+    model_dir,
+    gt_path,
+    chunk_size=CHUNK_SIZE,
+    enabled_blockers=None,
+):
     os.makedirs(model_dir, exist_ok=True)
 
     s1_path = os.path.join(cleaned_dir, "train_s1_cleaned.tsv")
     s2_path = os.path.join(cleaned_dir, "train_s2_cleaned.tsv")
     s3_path = os.path.join(cleaned_dir, "train_s3_cleaned.tsv")
 
-    X, y, val_mask, ids, cands, sources = build_training_matrix(
+    X, y, val_mask, val_ids, val_cands, val_sources = build_training_matrix(
         s1_path, s2_path, s3_path, gt_path, chunk_size, enabled_blockers
     )
 
@@ -151,9 +177,6 @@ def run_training(cleaned_dir, model_dir, gt_path, chunk_size=CHUNK_SIZE,
 
     if len(X_val):
         val_prob = model.predict_proba(X_val)[:, 1]
-        val_ids = [ids[i] for i in range(len(ids)) if val_mask[i]]
-        val_cands = [cands[i] for i in range(len(cands)) if val_mask[i]]
-        val_sources = [sources[i] for i in range(len(sources)) if val_mask[i]]
         pd.DataFrame(
             {
                 "s1_entity_id": val_ids,
