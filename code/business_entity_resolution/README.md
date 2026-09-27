@@ -54,6 +54,46 @@ Run a single stage, e.g.:
 python run_pipeline.py --stage predict --work-dir work --output-dir output
 ```
 
+## Fast iteration (skip the slow part on re-runs)
+
+The slow stage is `build-features`: it streams S2/S3 and computes the 24 features
+over every candidate pair. Its output is cached to
+`work/model/train_matrix.npz`, so fit the model and tune the decision layer in
+seconds afterwards:
+
+```bash
+# once (slow): build the feature matrix
+python run_pipeline.py --stage build-features --data-dir dataset --work-dir work --advanced-blocking
+
+# iterate cheaply
+python run_pipeline.py --stage train --work-dir work
+python run_pipeline.py --stage tune  --work-dir work
+```
+
+The cache is invalidated automatically when the blocker set or
+`--train-s1-rate` changes. Force a rebuild with `--no-reuse-features`.
+
+### Reuse cleaned data (skip normalize)
+
+If you already have cleaned TSVs (e.g. produced by notebook 03), point at them
+instead of re-normalising. Note they must be regenerated with the current
+`name_core` logic:
+
+```bash
+python run_pipeline.py all \
+    --cleaned-dir "/content/drive/.../03_Experiments/Cleaned_Data" \
+    --gt "/content/drive/.../dataset/train/train_ground_truth.tsv" \
+    --work-dir work --output-dir output --advanced-blocking
+```
+
+### Quick smoke run
+
+Subsample S1 entities for a fast end-to-end check before the full run:
+
+```bash
+python run_pipeline.py all --data-dir dataset --output-dir output --train-s1-rate 0.1
+```
+
 ## Improved blocking (optional, recommended)
 
 The default candidate generation is the frozen three-way union. Add the two
